@@ -29,14 +29,14 @@ The simulations were performed at three temperatures:
 
 ## Repository contents
 
-- `simulation.py`: main kinetic Monte Carlo simulation code.
-- `animations/`: animations obtained for the three temperatures.
-- `figures/`: selected plots and final results.
+- `Tritium-Diffusion_KMC.py`: main kinetic Monte Carlo simulation code.
+- `animations/`: animations obtained for the simulations at 300 K, 700 K and 1500 K.
 
 ## Main parameters
 
 - Lattice size: 200 × 200 sites
 - Initial number of tritium particles: 50
+- Initial occupation fraction: 0.125%
 - Migration energy: 0.25 eV
 - Attempt frequency: 1.90 × 10¹³ s⁻¹
 - Incident flux: 10²⁴ m⁻² s⁻¹
