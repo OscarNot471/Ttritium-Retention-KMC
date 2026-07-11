@@ -1,0 +1,1547 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime
+from random import random, randrange
+from PIL import Image
+
+def Generar_red(Lx, Ly, num_vacantes, num_dislocaciones, num_bordes_grano, num_cavidades):
+
+    red = np.zeros((Lx, Ly), dtype=int)
+
+    # 0 = sitio normal
+    # 1 = vacante
+    # 2 = dislocación
+    # 3 = borde de grano
+    # 4 = cavidad / void
+
+    def colocar_defectos_aleatorios(tipo_defecto, numero):
+        colocados = 0
+
+        while colocados < numero:
+            x = int(random() * Lx)
+            y = int(random() * Ly)
+
+            if red[x, y] == 0:
+                red[x, y] = tipo_defecto
+                colocados += 1
+
+    colocar_defectos_aleatorios(1, num_vacantes)
+    colocar_defectos_aleatorios(2, num_dislocaciones)
+    colocar_defectos_aleatorios(3, num_bordes_grano)
+    colocar_defectos_aleatorios(4, num_cavidades)
+
+    return red
+
+def Generar_particulas(N_h, Lx, Ly, red, capacidad):
+
+    pos = np.zeros((N_h, 2), dtype=int)
+    ocupacion = np.zeros((Lx, Ly), dtype=int)
+
+    for i in range(N_h):
+
+        while True:
+
+            x = int(random() * Lx)
+            y = int(random() * Ly)
+
+            tipo = red[x, y]
+
+            if ocupacion[x, y] < capacidad[tipo]:
+
+                pos[i] = [x, y]
+                ocupacion[x, y] += 1
+
+                break
+
+    return pos, ocupacion
+
+def obtener_E_b(tipo, n_ocupacion):
+
+    # Sitio normal
+    if tipo == 0:
+        return 0.0
+
+    # Tabla correspondiente al tipo de defecto
+    tabla = E_b_ocupacion[tipo]
+
+    indice = n_ocupacion - 1
+
+    if indice < 0:
+        indice = 0
+
+    if indice >= len(tabla):
+        indice = len(tabla) - 1
+
+    return tabla[indice]
+
+def Calculo_paso(pos, direcciones, red, ocupacion):
+
+    num_tipos = 5
+
+    saltos = [[[] for destino in range(num_tipos)] for origen in range(num_tipos)]
+    recombinaciones = [[] for tipo in range(num_tipos)]
+
+    N_h_actual = len(pos)
+
+    # ==========================
+    # Recuento de eventos de salto
+    # ==========================
+
+    for i in range(N_h_actual):
+
+        x = pos[i, 0]
+        y = pos[i, 1]
+
+        tipo_origen = red[x, y]
+
+        n_origen = ocupacion[x, y]
+
+        for nombre, dx, dy in direcciones:
+
+            x_new = (x + dx) % Lx
+            y_new = (y + dy) % Ly
+
+            tipo_destino = red[x_new, y_new]
+
+            if ocupacion[x_new, y_new] < capacidad[tipo_destino]:
+
+                evento = [
+                    "salto",
+                    i,
+                    nombre,
+                    dx,
+                    dy,
+                    tipo_origen,
+                    tipo_destino,
+                    n_origen
+                ]
+
+                saltos[tipo_origen][tipo_destino].append(evento)
+
+    # ==========================
+    # Recuento de eventos de recombinación
+    # ==========================
+
+    celdas_recomb = np.argwhere(ocupacion >= 2)
+
+    for x, y in celdas_recomb:
+
+        tipo = red[x, y]
+        n = ocupacion[x, y]
+
+        n_pares = n * (n - 1) // 2
+
+        for k in range(n_pares):
+
+            evento = [
+                "recombinacion",
+                x,
+                y,
+                tipo,
+                n
+            ]
+
+            recombinaciones[tipo].append(evento)
+
+    # ==========================
+    # Construcción de grupos de eventos
+    # ==========================
+
+    grupos_eventos = []
+
+    #Grupos de saltos
+
+    for origen in range(num_tipos):
+        for destino in range(num_tipos):
+
+            lista_eventos = saltos[origen][destino]
+
+            if len(lista_eventos) > 0:
+
+                # Antes todos los saltos origen->destino tenían la misma tasa.
+                # Ahora, si el origen es una trampa multiocupada, la tasa depende
+                # también de la ocupación del sitio de origen.
+
+                eventos_por_ocupacion = {}
+
+                for evento in lista_eventos:
+
+                    n_origen = evento[7]
+
+                    if n_origen not in eventos_por_ocupacion:
+                        eventos_por_ocupacion[n_origen] = []
+
+                    eventos_por_ocupacion[n_origen].append(evento)
+
+                for n_origen, lista_subgrupo in eventos_por_ocupacion.items():
+
+                    if origen == 0:
+                        E_evento = E_m
+                    else:
+                        E_b_local = obtener_E_b(origen, n_origen)
+                        E_evento = E_m + E_b_local
+
+                    Gamma_evento = nu0 * np.exp(-E_evento / (kB * T))
+
+                    tasa_grupo = len(lista_subgrupo) * Gamma_evento
+
+                    grupos_eventos.append([
+                        tasa_grupo,
+                        lista_subgrupo
+                    ])
+
+    #Grupos de recombinaciones por tipo de sitio
+
+    for tipo in range(num_tipos):
+
+        lista_eventos = recombinaciones[tipo]
+
+        if len(lista_eventos) > 0:
+
+            E_rec_local = E_rec_tipo[tipo]
+
+            Gamma_rec = nu0 * np.exp(-E_rec_local / (kB * T))
+
+            tasa_grupo = len(lista_eventos) * Gamma_rec
+
+            grupos_eventos.append([
+                tasa_grupo,
+                lista_eventos
+            ])
+
+    # ==========================
+    # Tasa total
+    # ==========================
+
+    R = 0.0
+
+    for tasa_grupo, lista_eventos in grupos_eventos:
+        R += tasa_grupo
+
+    if R == 0:
+        return None, R
+
+    # ==========================
+    # Selección de grupo y evento
+    # ==========================
+
+    chi = random() * R
+    acumulada = 0.0
+
+    for tasa_grupo, lista_eventos in grupos_eventos:
+
+        acumulada += tasa_grupo
+
+        if chi < acumulada:
+
+            s = int(random() * len(lista_eventos))
+
+            evento_selec = lista_eventos[s]
+
+            return evento_selec, R
+
+    tasa_grupo, lista_eventos = grupos_eventos[-1]
+    s = int(random() * len(lista_eventos))
+
+    return lista_eventos[s], R
+
+
+def ejecutar_paso_KMC(pos, pos_real, pos_inicial, evento_elegido, R, t, red, ocupacion):
+
+    tipo_evento = evento_elegido[0]
+
+    # ==========================
+    # Evento de salto
+    # ==========================
+
+    if tipo_evento == "salto":
+
+        _, p, nombre, dx, dy, tipo_origen, tipo_destino, n_origen = evento_elegido
+
+        x, y = pos[p]
+
+        x_new = (x + dx) % Lx
+        y_new = (y + dy) % Ly
+
+        pos[p] = [x_new, y_new]
+
+        pos_real[p, 0] += dx
+        pos_real[p, 1] += dy
+
+        ocupacion[x, y] -= 1
+        ocupacion[x_new, y_new] += 1
+
+    # ==========================
+    # Evento de recombinación
+    # ==========================
+
+    elif tipo_evento == "recombinacion":
+
+        _, x, y, tipo, n = evento_elegido
+
+        indices = np.where(
+            (pos[:, 0] == x) &
+            (pos[:, 1] == y)
+        )[0]
+
+        if len(indices) >= 2:
+
+            indices_eliminar = np.random.choice(
+                indices,
+                size=2,
+                replace=False
+            )
+
+            mascara = np.ones(len(pos), dtype=bool)
+            mascara[indices_eliminar] = False
+
+            pos = pos[mascara]
+            pos_real = pos_real[mascara]
+            pos_inicial = pos_inicial[mascara]
+
+            ocupacion[x, y] -= 2
+
+    # ==========================
+    # Avance temporal KMC
+    # ==========================
+
+    u = max(random(), 1e-15)
+    dt = -np.log(u) / R
+
+    t += dt
+
+    return pos, pos_real, pos_inicial, t, dt, ocupacion
+
+def implantar_particulas(pos, pos_real, pos_inicial, ocupacion, red, capacidad, N_nuevas):
+
+    implantadas = 0
+
+    intentos = 0
+    intentos_max = 10000
+
+    while implantadas < N_nuevas and intentos < intentos_max:
+
+        x = int(random() * Lx)
+        y = int(random() * Ly)
+
+        tipo = red[x, y]
+
+        # Solo implantamos si la celda tiene capacidad disponible
+        if ocupacion[x, y] < capacidad[tipo]:
+
+            nueva_pos = np.array([[x, y]], dtype=int)
+
+            # Añadimos la partícula a la lista de posiciones
+            pos = np.vstack((pos, nueva_pos))
+
+            # Su posición real inicial es la posición donde entra
+            pos_real = np.vstack((pos_real, nueva_pos.copy()))
+
+            # Para el MSD, su posición inicial también es donde entra
+            pos_inicial = np.vstack((pos_inicial, nueva_pos.copy()))
+
+            # Actualizamos ocupación
+            ocupacion[x, y] += 1
+
+            implantadas += 1
+
+        intentos += 1
+
+    return pos, pos_real, pos_inicial, ocupacion, implantadas
+
+
+# ==========================
+# Constantes físicas
+# ==========================
+
+kB = 8.617e-5      # eV/K
+nu0 = 1.90e13     # s^-1
+
+# ==========================
+# Energías
+# ==========================
+
+E_m = 0.25  # eV, migración libre
+
+# Energías de recombinación según el tipo de sitio
+# 0 = sitio normal
+# 1 = vacante
+# 2 = dislocación
+# 3 = borde de grano
+# 4 = cavidad / void
+
+E_rec_tipo = np.array([
+    0.90,  # sitio normal / superficie efectiva
+    1.20,  # vacante
+    1.00,  # dislocación
+    0.95,  # borde de grano
+    0.70   # cavidad / void
+])
+
+# Energías de enlace dependientes de la ocupación
+# E_b_ocupacion[tipo][n-1]
+# donde n es la ocupación de la celda de origen.
+
+E_b_ocupacion = {
+    # Sitio normal: capacidad 1
+    0: np.array([
+        0.0
+    ]),
+
+    # Vacante: los dos primeros T están fuertemente atrapados,
+    # los siguientes progresivamente menos.
+    1: np.array([
+        1.32,
+        1.30,
+        1.10,
+        0.90,
+        0.70,
+        0.50
+    ]),
+
+    # Dislocación: trampa moderada.
+    2: np.array([
+        0.80,
+        0.70,
+        0.60,
+        0.50
+    ]),
+
+    # Borde de grano.
+    3: np.array([
+        1.05,
+        0.95,
+        0.85,
+        0.75
+    ]),
+
+    # Cavidad / void: fuerte al principio, pero más fácil
+    # que salgan partículas cuando la cavidad se llena.
+    4: np.array([
+        1.85,
+        1.70,
+        1.50,
+        1.30,
+        1.10,
+        0.95,
+        0.85,
+        0.75,
+        0.65,
+        0.55,
+        0.50,
+        0.45,
+        0.40,
+        0.35,
+        0.30
+    ])
+}
+
+# Para mantener compatibilidad en textos/gráficas si lo quieres usar después.
+# Ya no lo usaremos para calcular las tasas de salida.
+E_b = np.array([
+    0.0,
+    E_b_ocupacion[1][0],
+    E_b_ocupacion[2][0],
+    E_b_ocupacion[3][0],
+    E_b_ocupacion[4][0]
+])
+
+# ==========================
+# Capacidades
+# ==========================
+
+capacidad = np.array([
+    1,    # sitio normal
+    6,    # vacante
+    4,    # dislocación
+    4,    # borde de grano
+    15    # cavidad / void
+])
+
+# ==========================
+# Temperatura
+# ==========================
+
+T = 1500  # K
+
+# Red superficial
+Lx = 200
+Ly = 200
+
+num_vacantes = 10
+num_dislocaciones = 5
+num_bordes_grano = 5
+num_cavidades = 2
+
+red = Generar_red(Lx, Ly, num_vacantes, num_dislocaciones, num_bordes_grano, num_cavidades)
+                  
+# Partículas de tritio
+N_h = 50
+guardar_cada = 50
+
+pos, ocupacion = Generar_particulas(N_h, Lx, Ly, red, capacidad)
+    
+pos_real = pos.copy()
+pos_inicial = pos_real.copy()
+    
+
+# Distancia física de salto
+d = 1.12e-10      # m
+
+#Direcciones
+direcciones = [
+    ("derecha",  1,  0),
+    ("izquierda", -1,  0),
+    ("arriba",    0,  1),
+    ("abajo",     0, -1)
+]
+
+# ==========================
+# Flujo incidente
+# ==========================
+
+flujo = 1e24  # m^-2 s^-1
+
+area = (Lx * d) * (Ly * d)
+
+dt_flujo = 1e-9  # s
+
+t_siguiente_flujo = dt_flujo
+
+print(f"Área simulada = {area:.3e} m^2")
+print(f"Tasa media de llegada = {flujo * area:.3e} partículas/s")
+print(f"Partículas medias cada dt_flujo = {flujo * area * dt_flujo:.3f}")
+
+
+# ==========================
+# Ejecución
+# ==========================
+
+N_eventos = 2000000
+
+# Tiempo físico máximo de simulación
+t_final = 2e-5  # s = 200 ns
+
+# Guardado para animación
+guardar_cada = 500
+
+t = 0.0
+dt = np.zeros(N_eventos)
+
+eventos_MCK = []
+
+trayectoria = [pos.copy()]
+tiempos_anim = [0.0]
+
+tiempos = []
+msd_lista = []
+
+# Listas para estudiar retención / atrapamiento
+libres_lista = []
+atrapadas_lista = []
+
+vacantes_lista = []
+dislocaciones_lista = []
+bordes_lista = []
+cavidades_lista = []
+
+# Listas para estudiar el flujo
+total_particulas_lista = []
+implantadas_lista = []
+implantadas_acumuladas_lista = []
+
+implantadas_acumuladas = 0
+
+# Listas para estudiar recombinación
+recombinaciones_lista = []
+recombinaciones_acumuladas_lista = []
+
+recombinaciones_acumuladas = 0
+
+
+for i in range(N_eventos):
+
+    # ==========================
+    # Criterio de parada por tiempo físico
+    # ==========================
+
+    if t >= t_final:
+        print("Se alcanzó el tiempo final de simulación")
+        break
+
+    # ==========================
+    # Mostrar progreso
+    # ==========================
+
+    if i % 1000 == 0:
+        porcentaje_eventos = 100 * i / N_eventos
+        porcentaje_tiempo = 100 * t / t_final
+
+        print(
+            f"Progreso eventos: {porcentaje_eventos:.1f}% | "
+            f"Progreso tiempo: {porcentaje_tiempo:.1f}% | "
+            f"t = {t * 1e9:.3f} ns | "
+            f"N = {len(pos)}"
+        )
+
+    # ==========================
+    # Selección del evento KMC
+    # ==========================
+
+    evento_selec, R = Calculo_paso(pos, direcciones, red, ocupacion)
+
+    if evento_selec is None:
+        print("No quedan eventos posibles")
+        break
+
+    eventos_MCK.append(evento_selec)
+
+    # ==========================
+    # Ejecución del evento KMC
+    # ==========================
+
+    pos, pos_real, pos_inicial, t, dt[i], ocupacion = ejecutar_paso_KMC(
+        pos,
+        pos_real,
+        pos_inicial,
+        evento_selec,
+        R,
+        t,
+        red,
+        ocupacion
+    )
+
+    # ==========================
+    # Recuento de recombinaciones
+    # ==========================
+
+    if evento_selec[0] == "recombinacion":
+        recombinaciones_acumuladas += 1
+        recombinaciones_lista.append(1)
+    else:
+        recombinaciones_lista.append(0)
+
+    recombinaciones_acumuladas_lista.append(recombinaciones_acumuladas)
+
+    # ==========================
+    # Implantación por flujo externo
+    # ==========================
+
+    implantadas_este_paso = 0
+
+    while t >= t_siguiente_flujo:
+
+        media_implantacion = flujo * area * dt_flujo
+
+        N_nuevas = np.random.poisson(media_implantacion)
+
+        pos, pos_real, pos_inicial, ocupacion, implantadas = implantar_particulas(
+            pos,
+            pos_real,
+            pos_inicial,
+            ocupacion,
+            red,
+            capacidad,
+            N_nuevas
+        )
+
+        implantadas_este_paso += implantadas
+        implantadas_acumuladas += implantadas
+
+        t_siguiente_flujo += dt_flujo
+
+    # ==========================
+    # Cálculo del MSD
+    # ==========================
+
+    desplazamiento = pos_real - pos_inicial
+
+    msd_red = np.mean(
+        desplazamiento[:, 0]**2 + desplazamiento[:, 1]**2
+    )
+
+    msd_fisico = msd_red * d**2
+
+    tiempos.append(t)
+    msd_lista.append(msd_fisico)
+
+    # ==========================
+    # Recuento de partículas libres y atrapadas
+    # ==========================
+
+    N_h_actual = len(pos)
+
+    tipos_particulas = red[pos[:, 0], pos[:, 1]]
+
+    n_libres = np.sum(tipos_particulas == 0)
+
+    n_vacantes = np.sum(tipos_particulas == 1)
+    n_dislocaciones = np.sum(tipos_particulas == 2)
+    n_bordes = np.sum(tipos_particulas == 3)
+    n_cavidades = np.sum(tipos_particulas == 4)
+
+    n_atrapadas = N_h_actual - n_libres
+
+    libres_lista.append(n_libres)
+    atrapadas_lista.append(n_atrapadas)
+
+    vacantes_lista.append(n_vacantes)
+    dislocaciones_lista.append(n_dislocaciones)
+    bordes_lista.append(n_bordes)
+    cavidades_lista.append(n_cavidades)
+
+    total_particulas_lista.append(N_h_actual)
+    implantadas_lista.append(implantadas_este_paso)
+    implantadas_acumuladas_lista.append(implantadas_acumuladas)
+
+    # ==========================
+    # Guardado para animación
+    # ==========================
+
+    if i % guardar_cada == 0:
+        trayectoria.append(pos.copy())
+        tiempos_anim.append(t)
+
+# Guardar también el estado final real
+if tiempos_anim[-1] < t:
+    trayectoria.append(pos.copy())
+    tiempos_anim.append(t)
+
+print("Simulación terminada")
+print(f"Último evento calculado: {i}")
+print(f"Tiempo final alcanzado: {t:.6e} s")
+print(f"Tiempo final alcanzado: {t * 1e9:.3f} ns")
+print(f"Número final de partículas: {len(pos)}")
+
+
+# ==========================
+# Conversión a arrays
+# ==========================
+
+tiempos = np.array(tiempos)
+msd_lista = np.array(msd_lista)
+
+libres_lista = np.array(libres_lista)
+atrapadas_lista = np.array(atrapadas_lista)
+
+vacantes_lista = np.array(vacantes_lista)
+dislocaciones_lista = np.array(dislocaciones_lista)
+bordes_lista = np.array(bordes_lista)
+cavidades_lista = np.array(cavidades_lista)
+
+total_particulas_lista = np.array(total_particulas_lista)
+implantadas_lista = np.array(implantadas_lista)
+implantadas_acumuladas_lista = np.array(implantadas_acumuladas_lista)
+
+recombinaciones_lista = np.array(recombinaciones_lista)
+recombinaciones_acumuladas_lista = np.array(recombinaciones_acumuladas_lista)
+
+
+# ==========================
+# Carpeta de resultados
+# ==========================
+
+nombre_simulacion = datetime.now().strftime("simulacion_%Y%m%d_%H%M%S")
+
+carpeta_resultados = os.path.join("resultados_KMC", nombre_simulacion)
+
+os.makedirs(carpeta_resultados, exist_ok=True)
+
+print("Guardando resultados en:", carpeta_resultados)
+
+# Si quieres que también se abran las ventanas de las gráficas, pon True
+mostrar_figuras = False
+
+
+def guardar_figura(fig, nombre_archivo):
+
+    ruta = os.path.join(carpeta_resultados, nombre_archivo)
+
+    fig.savefig(
+        ruta,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    print("Figura guardada:", ruta)
+
+    if mostrar_figuras:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+# ==========================
+# 1. Evolución del número total de partículas
+# ==========================
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.step(
+    tiempos * 1e9,
+    total_particulas_lista,
+    where="post",
+    linewidth=2.2,
+    label="Partículas retenidas"
+)
+
+ax.set_xlabel("Tiempo (ns)")
+ax.set_ylabel("Número de partículas de tritio")
+ax.set_title("Evolución de la retención de tritio")
+ax.legend()
+ax.grid(True)
+
+guardar_figura(fig, "01_retencion_total.png")
+
+
+# ==========================
+# 2. Partículas libres y atrapadas
+# ==========================
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.plot(
+    tiempos * 1e9,
+    libres_lista,
+    linewidth=2,
+    label="Partículas libres"
+)
+
+ax.plot(
+    tiempos * 1e9,
+    atrapadas_lista,
+    linewidth=2,
+    label="Partículas atrapadas"
+)
+
+ax.set_xlabel("Tiempo (ns)")
+ax.set_ylabel("Número de partículas de tritio")
+ax.set_title("Evolución de partículas libres y atrapadas")
+ax.legend()
+ax.grid(True)
+
+guardar_figura(fig, "02_libres_atrapadas.png")
+
+
+# ==========================
+# 3. Partículas atrapadas por tipo de defecto
+# ==========================
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.plot(
+    tiempos * 1e9,
+    vacantes_lista,
+    linewidth=2,
+    label="Vacantes"
+)
+
+ax.plot(
+    tiempos * 1e9,
+    dislocaciones_lista,
+    linewidth=2,
+    label="Dislocaciones"
+)
+
+ax.plot(
+    tiempos * 1e9,
+    bordes_lista,
+    linewidth=2,
+    label="Bordes de grano"
+)
+
+ax.plot(
+    tiempos * 1e9,
+    cavidades_lista,
+    linewidth=2,
+    label="Cavidades"
+)
+
+ax.set_xlabel("Tiempo (ns)")
+ax.set_ylabel("Número de partículas atrapadas")
+ax.set_title("Distribución del tritio atrapado según el tipo de defecto")
+ax.legend()
+ax.grid(True)
+
+guardar_figura(fig, "03_atrapadas_por_defecto.png")
+
+# ==========================
+# 4. Implantación y recombinación acumuladas
+# ==========================
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.step(
+    tiempos * 1e9,
+    implantadas_acumuladas_lista,
+    where="post",
+    linewidth=2,
+    label="Partículas implantadas acumuladas"
+)
+
+ax.step(
+    tiempos * 1e9,
+    2 * recombinaciones_acumuladas_lista,
+    where="post",
+    linewidth=2,
+    linestyle="--",
+    label="Partículas eliminadas por recombinación"
+)
+
+ax.set_xlabel("Tiempo (ns)")
+ax.set_ylabel("Número de partículas")
+ax.set_title("Competencia entre implantación y recombinación")
+ax.legend()
+ax.grid(True)
+
+guardar_figura(fig, "04_implantacion_vs_recombinacion.png")
+
+print("Tiempo final:", tiempos[-1], "s")
+print("Tiempo final:", tiempos[-1] * 1e12, "ps")
+print("Tiempo final:", tiempos[-1] * 1e9, "ns")
+
+# ==========================
+# Balance final
+# ==========================
+
+balance_teorico = (
+    N_h
+    + implantadas_acumuladas_lista[-1]
+    - 2 * recombinaciones_acumuladas_lista[-1]
+)
+
+diferencia_balance = total_particulas_lista[-1] - balance_teorico
+
+texto_balance = f"""
+Balance final:
+
+Libres: {libres_lista[-1]}
+Atrapadas: {atrapadas_lista[-1]}
+
+En vacantes: {vacantes_lista[-1]}
+En dislocaciones: {dislocaciones_lista[-1]}
+En bordes de grano: {bordes_lista[-1]}
+En cavidades: {cavidades_lista[-1]}
+
+Total final: {total_particulas_lista[-1]}
+
+Partículas iniciales: {N_h}
+Partículas implantadas: {implantadas_acumuladas_lista[-1]}
+Recombinaciones: {recombinaciones_acumuladas_lista[-1]}
+
+Iniciales + implantadas - 2*recombinaciones: {balance_teorico}
+Diferencia: {diferencia_balance}
+
+Tiempo final: {tiempos[-1]:.6e} s
+Tiempo final: {tiempos[-1] * 1e12:.3f} ps
+Tiempo final: {tiempos[-1] * 1e9:.3f} ns
+
+Parámetros principales:
+
+Lx = {Lx}
+Ly = {Ly}
+N_h inicial = {N_h}
+N_eventos = {N_eventos}
+guardar_cada = {guardar_cada}
+
+T = {T} K
+E_m = {E_m} eV
+
+E_rec_tipo = {E_rec_tipo}
+
+E_b_ocupacion:
+sitio normal = {E_b_ocupacion[0]}
+vacante = {E_b_ocupacion[1]}
+dislocacion = {E_b_ocupacion[2]}
+borde de grano = {E_b_ocupacion[3]}
+cavidad = {E_b_ocupacion[4]}
+
+capacidad = {capacidad}
+
+flujo = {flujo:.3e} m^-2 s^-1
+area = {area:.3e} m^2
+dt_flujo = {dt_flujo:.3e} s
+"""
+
+print(texto_balance)
+
+ruta_balance = os.path.join(carpeta_resultados, "balance_final.txt")
+
+with open(ruta_balance, "w", encoding="utf-8") as f:
+    f.write(texto_balance)
+
+print("Balance guardado en:", ruta_balance)
+
+
+# ==========================
+# Animación guardada como GIF
+# ==========================
+
+def guardar_animacion_gif(
+    trayectoria,
+    tiempos,
+    red,
+    Lx,
+    Ly,
+    guardar_cada,
+    carpeta_resultados,
+    fps=15,
+    max_frames=300
+):
+
+    ruta_animacion = os.path.join(
+        carpeta_resultados,
+        "animacion_difusion.gif"
+    )
+
+    print("Preparando animación...")
+
+    n_frames_total = len(trayectoria)
+
+    if n_frames_total == 0:
+        print("No hay frames guardados para la animación.")
+        return
+
+    # Si hay demasiados frames, seleccionamos solo algunos
+    if n_frames_total > max_frames:
+        indices_frames = np.linspace(
+            0,
+            n_frames_total - 1,
+            max_frames,
+            dtype=int
+        )
+    else:
+        indices_frames = np.arange(n_frames_total)
+
+    frames_gif = []
+
+    # Coordenadas fijas de defectos
+    x_vac, y_vac = np.where(red == 1)
+    x_dis, y_dis = np.where(red == 2)
+    x_gb, y_gb = np.where(red == 3)
+    x_cav, y_cav = np.where(red == 4)
+
+    for contador, frame in enumerate(indices_frames):
+
+        if contador % 25 == 0:
+            print(f"Frame animación: {contador}/{len(indices_frames)}")
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        fig.subplots_adjust(right=0.78)
+
+        # Fondo
+        fondo = np.zeros((Lx, Ly))
+
+        ax.imshow(
+            fondo.T,
+            origin="lower",
+            extent=[0, Lx, 0, Ly],
+            cmap="Blues",
+            vmin=-1,
+            vmax=1
+        )
+
+        # Defectos
+        ax.scatter(
+            x_vac + 0.5,
+            y_vac + 0.5,
+            marker="s",
+            s=8,
+            c="black",
+            label="Vacantes"
+        )
+
+        ax.scatter(
+            x_dis + 0.5,
+            y_dis + 0.5,
+            marker="s",
+            s=8,
+            c="red",
+            label="Dislocaciones"
+        )
+
+        ax.scatter(
+            x_gb + 0.5,
+            y_gb + 0.5,
+            marker="s",
+            s=8,
+            c="orange",
+            label="Bordes de grano"
+        )
+
+        ax.scatter(
+            x_cav + 0.5,
+            y_cav + 0.5,
+            marker="s",
+            s=12,
+            c="purple",
+            label="Cavidades"
+        )
+
+        # Partículas
+        posiciones = trayectoria[frame]
+
+        libres = []
+        atrapadas = []
+
+        for x, y in posiciones:
+            if red[x, y] == 0:
+                libres.append([x + 0.5, y + 0.5])
+            else:
+                atrapadas.append([x + 0.5, y + 0.5])
+
+        if len(atrapadas) > 0:
+            atrapadas = np.array(atrapadas)
+
+            ax.scatter(
+                atrapadas[:, 0],
+                atrapadas[:, 1],
+                marker="s",
+                s=22,
+                c="yellow",
+                edgecolors="black",
+                linewidths=0.4,
+                label="Tritio atrapado"
+            )
+
+        if len(libres) > 0:
+            libres = np.array(libres)
+
+            ax.scatter(
+                libres[:, 0],
+                libres[:, 1],
+                marker="s",
+                s=6,
+                c="cyan",
+                edgecolors="white",
+                linewidths=0.2,
+                alpha=0.75,
+                label="Tritio libre"
+            )
+
+        # Formato
+        ax.set_xlim(0, Lx)
+        ax.set_ylim(0, Ly)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_aspect("equal")
+
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+        ax.set_title(
+            f"Difusión de tritio - t = {tiempos[frame] * 1e9:.3f} ns"
+        )
+
+        # Convertir figura a imagen
+        fig.canvas.draw()
+
+        imagen = np.asarray(fig.canvas.buffer_rgba())
+        imagen_pil = Image.fromarray(imagen)
+
+        frames_gif.append(imagen_pil.convert("P"))
+
+        plt.close(fig)
+
+    print("Guardando animación en:", ruta_animacion)
+
+    duracion_ms = int(1000 / fps)
+
+    frames_gif[0].save(
+        ruta_animacion,
+        save_all=True,
+        append_images=frames_gif[1:],
+        duration=duracion_ms,
+        loop=0
+    )
+
+    print("Animación guardada:", ruta_animacion)
+
+
+
+
+def guardar_capturas_animacion(
+    trayectoria,
+    tiempos,
+    red,
+    Lx,
+    Ly,
+    guardar_cada,
+    carpeta_resultados
+):
+    carpeta_capturas = os.path.join(carpeta_resultados, "capturas_animacion")
+    os.makedirs(carpeta_capturas, exist_ok=True)
+
+    if len(trayectoria) == 0:
+        print("No hay frames guardados para capturas.")
+        return
+
+    n_frames = len(trayectoria)
+
+    # Capturas: inicio, 1/3, 2/3 y final
+    indices_capturas = [
+        0,
+        int((n_frames - 1) / 3),
+        int(2 * (n_frames - 1) / 3),
+        n_frames - 1
+    ]
+
+    nombres_archivo = [
+        "captura_01_inicio.png",
+        "captura_02_un_tercio.png",
+        "captura_03_dos_tercios.png",
+        "captura_04_final.png"
+    ]
+
+    titulos = [
+        "Inicio",
+        "Un tercio de la simulación",
+        "Dos tercios de la simulación",
+        "Estado final"
+    ]
+
+    # Coordenadas fijas de defectos
+    x_vac, y_vac = np.where(red == 1)
+    x_dis, y_dis = np.where(red == 2)
+    x_gb, y_gb = np.where(red == 3)
+    x_cav, y_cav = np.where(red == 4)
+
+    for indice, nombre_img, titulo in zip(indices_capturas, nombres_archivo, titulos):
+
+        posiciones = trayectoria[indice]
+        tiempo_frame = tiempos[indice]
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        fig.subplots_adjust(right=0.78)
+
+        # Fondo
+        fondo = np.zeros((Lx, Ly))
+
+        ax.imshow(
+            fondo.T,
+            origin="lower",
+            extent=[0, Lx, 0, Ly],
+            cmap="Blues",
+            vmin=-1,
+            vmax=1
+        )
+
+        # Defectos
+        ax.scatter(
+            x_vac + 0.5,
+            y_vac + 0.5,
+            marker="s",
+            s=8,
+            c="black",
+            label="Vacantes"
+        )
+
+        ax.scatter(
+            x_dis + 0.5,
+            y_dis + 0.5,
+            marker="s",
+            s=8,
+            c="red",
+            label="Dislocaciones"
+        )
+
+        ax.scatter(
+            x_gb + 0.5,
+            y_gb + 0.5,
+            marker="s",
+            s=8,
+            c="orange",
+            label="Bordes de grano"
+        )
+
+        ax.scatter(
+            x_cav + 0.5,
+            y_cav + 0.5,
+            marker="s",
+            s=12,
+            c="purple",
+            label="Cavidades"
+        )
+
+        # Partículas
+        libres = []
+        atrapadas = []
+
+        for x, y in posiciones:
+            if red[x, y] == 0:
+                libres.append([x + 0.5, y + 0.5])
+            else:
+                atrapadas.append([x + 0.5, y + 0.5])
+
+        if len(atrapadas) > 0:
+            atrapadas = np.array(atrapadas)
+
+            ax.scatter(
+                atrapadas[:, 0],
+                atrapadas[:, 1],
+                marker="s",
+                s=22,
+                c="yellow",
+                edgecolors="black",
+                linewidths=0.4,
+                label="Tritio atrapado"
+            )
+
+        if len(libres) > 0:
+            libres = np.array(libres)
+
+            ax.scatter(
+                libres[:, 0],
+                libres[:, 1],
+                marker="s",
+                s=6,
+                c="cyan",
+                edgecolors="white",
+                linewidths=0.2,
+                alpha=0.75,
+                label="Tritio libre"
+            )
+
+        ax.set_xlim(0, Lx)
+        ax.set_ylim(0, Ly)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_aspect("equal")
+
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+        ax.set_title(
+            f"{titulo} - t = {tiempo_frame * 1e9:.3f} ns"
+        )
+
+        ruta_imagen = os.path.join(carpeta_capturas, nombre_img)
+
+        fig.savefig(
+            ruta_imagen,
+            dpi=300,
+            bbox_inches="tight"
+        )
+
+        plt.close(fig)
+
+        print("Captura guardada:", ruta_imagen)
+
+
+guardar_animacion_gif(
+    trayectoria,
+    tiempos_anim,
+    red,
+    Lx,
+    Ly,
+    guardar_cada,
+    carpeta_resultados,
+    fps=15,
+    max_frames=300
+)
+
+guardar_capturas_animacion(
+    trayectoria,
+    tiempos_anim,
+    red,
+    Lx,
+    Ly,
+    guardar_cada,
+    carpeta_resultados
+)
+
+
+
+
+# ==========================
+# Exportar matrices y datos finales
+# ==========================
+
+import csv
+
+nombres_tipos = {
+    0: "sitio normal",
+    1: "vacante",
+    2: "dislocacion",
+    3: "borde de grano",
+    4: "cavidad"
+}
+
+# --------------------------
+# 1. Matriz de defectos
+# --------------------------
+# red[x, y]:
+# 0 = sitio normal
+# 1 = vacante
+# 2 = dislocación
+# 3 = borde de grano
+# 4 = cavidad
+
+ruta_red = os.path.join(carpeta_resultados, "matriz_defectos_red.csv")
+
+np.savetxt(
+    ruta_red,
+    red,
+    fmt="%d",
+    delimiter=","
+)
+
+print("Matriz de defectos guardada en:", ruta_red)
+
+
+# --------------------------
+# 2. Matriz de ocupación final
+# --------------------------
+# ocupacion[x, y] indica cuántas partículas hay en cada celda.
+
+ruta_ocupacion = os.path.join(carpeta_resultados, "matriz_ocupacion_final.csv")
+
+np.savetxt(
+    ruta_ocupacion,
+    ocupacion,
+    fmt="%d",
+    delimiter=","
+)
+
+print("Matriz de ocupación final guardada en:", ruta_ocupacion)
+
+
+# --------------------------
+# 3. Lista de partículas finales
+# --------------------------
+# Cada fila representa una partícula que sigue dentro de la simulación.
+
+ruta_particulas = os.path.join(carpeta_resultados, "particulas_finales.csv")
+
+with open(ruta_particulas, "w", newline="", encoding="utf-8") as f:
+
+    writer = csv.writer(f)
+
+    writer.writerow([
+        "id_particula",
+        "x",
+        "y",
+        "tipo_sitio",
+        "nombre_sitio",
+        "estado",
+        "ocupacion_celda",
+        "pos_real_x",
+        "pos_real_y",
+        "pos_inicial_x",
+        "pos_inicial_y"
+    ])
+
+    for i in range(len(pos)):
+
+        x = pos[i, 0]
+        y = pos[i, 1]
+
+        tipo = red[x, y]
+
+        if tipo == 0:
+            estado = "libre"
+        else:
+            estado = "atrapada"
+
+        writer.writerow([
+            i,
+            x,
+            y,
+            tipo,
+            nombres_tipos[tipo],
+            estado,
+            ocupacion[x, y],
+            pos_real[i, 0],
+            pos_real[i, 1],
+            pos_inicial[i, 0],
+            pos_inicial[i, 1]
+        ])
+
+print("Lista de partículas finales guardada en:", ruta_particulas)
+
+
+# --------------------------
+# 4. Lista de defectos y ocupación
+# --------------------------
+# Cada fila representa un defecto de la red.
+
+ruta_defectos = os.path.join(carpeta_resultados, "defectos_finales.csv")
+
+with open(ruta_defectos, "w", newline="", encoding="utf-8") as f:
+
+    writer = csv.writer(f)
+
+    writer.writerow([
+        "id_defecto",
+        "x",
+        "y",
+        "tipo_defecto",
+        "nombre_defecto",
+        "capacidad",
+        "ocupacion_final",
+        "fraccion_ocupada"
+    ])
+
+    id_defecto = 0
+
+    for x in range(Lx):
+        for y in range(Ly):
+
+            tipo = red[x, y]
+
+            if tipo != 0:
+
+                cap = capacidad[tipo]
+                occ = ocupacion[x, y]
+
+                writer.writerow([
+                    id_defecto,
+                    x,
+                    y,
+                    tipo,
+                    nombres_tipos[tipo],
+                    cap,
+                    occ,
+                    occ / cap
+                ])
+
+                id_defecto += 1
+
+print("Lista de defectos finales guardada en:", ruta_defectos)
+
+
+# --------------------------
+# 5. Cálculo de capacidad total
+# --------------------------
+
+n_sitios_normales = np.sum(red == 0)
+
+n_vacantes = np.sum(red == 1)
+n_dislocaciones = np.sum(red == 2)
+n_bordes = np.sum(red == 3)
+n_cavidades = np.sum(red == 4)
+
+capacidad_sitios_normales = n_sitios_normales * capacidad[0]
+capacidad_vacantes = n_vacantes * capacidad[1]
+capacidad_dislocaciones = n_dislocaciones * capacidad[2]
+capacidad_bordes = n_bordes * capacidad[3]
+capacidad_cavidades = n_cavidades * capacidad[4]
+
+capacidad_total_trampas = (
+    capacidad_vacantes
+    + capacidad_dislocaciones
+    + capacidad_bordes
+    + capacidad_cavidades
+)
+
+capacidad_total_red = (
+    capacidad_sitios_normales
+    + capacidad_total_trampas
+)
+
+ocupacion_total_trampas = np.sum(ocupacion[red != 0])
+ocupacion_total_red = np.sum(ocupacion)
+
+print("Capacidad total en trampas:", capacidad_total_trampas)
+print("Ocupación total en trampas:", ocupacion_total_trampas)
+print("Capacidad total de la red:", capacidad_total_red)
+print("Ocupación total de la red:", ocupacion_total_red)
